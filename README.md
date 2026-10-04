@@ -1,236 +1,169 @@
-# TRACE navigation: simulation and ROS 2 reference implementation
+# TRACE
 
-This directory implements the method described in `../latex/main.tex`: temporal
-scene encoding, candidate generation, action-conditioned consequence prediction,
-branch/intervention supervision, explicit risk screening, decision records, and
-asynchronous checked explanations. It contains a shared learning/control package,
-a reference simulation workflow, a live CARLA adapter, and ROS 2 robot nodes.
+**Grounding Navigation Actions and Explanations in Predicted Consequences**
 
-**Implementation status:** the code has been written and statically reviewed.
-Training, dependency installation, model inference, CARLA, and ROS have not been
-run as part of this delivery. No checkpoints or experimental results are bundled.
-This is a reference implementation of the design, not a recovered implementation
-of the paper's reported experiments. No runtime or reproduction claim is made.
+This repository contains the TRACE navigation implementation, including training, consequence calibration, asynchronous explanations, simulation interfaces, and ROS 2 deployment nodes.
 
-## 1. Project layout
+## Prerequisites
 
-```text
-code/
-  pyproject.toml                 Python package and optional language dependencies
-  configs/default.yaml          Core reference hyperparameters
-  configs/ros.yaml              ROS node parameters and explicit arming switch
-  docs/data_schema.md           Tensor, manifest, language, and ROS data formats
-  tools/static_check.py         Dependency-free Python syntax inspection
-  src/trace_nav/
-    config.py                   Configuration validation and random seeds
-    observations.py             Fixed-shape sensor contract and temporal history
-    models.py                   Cross-attention encoder, mixture generator, ensemble
-    decision.py                 Screening, selection, fallback, decision record
-    controller.py               Checkpoint/calibration loading and cited-sequence reevaluation
-    explanation.py              Claim verification, rendering, asynchronous worker
-    evaluation.py               SR/CR/TR/AT and probability metric utilities
-    training/
-      data.py                   NPZ manifest loader and source-group leakage check
-      train.py                  Stage 1 and stage 2 optimization
-      calibrate.py              Isotonic fitting and cluster-bootstrap rule selection
-      language.py               Stage 3 LoRA adaptation for local instruction models
-    simulation/
-      world.py                  Restorable 2-D reference crowd world and outcome targets
-      collect.py                Demonstration, branching, and intervention collection
-      run.py                    Closed-loop execution and JSONL logging
-      adapters.py               External simulator protocol and dynamic adapter loading
-      carla_adapter.py          Live sensor-based CARLA walker surrogate
-    real_world/
-      sensor_bridge.py          RGB/LiDAR/odometry/goal/pedestrian input bridge
-      node.py                   ROS controller, watchdog, stop logic, record publication
+- Python 3.10 or newer.
+- A PyTorch installation compatible with the target CPU or GPU.
+- CARLA server and matching Python client for CARLA evaluation.
+- ROS 2, `rclpy`, `cv_bridge`, OpenCV, and standard sensor/navigation message packages for robot deployment.
+
+Datasets, trained checkpoints, and language-model weights are not included. The provided source has undergone static syntax checks; end-to-end execution and reproduction of the reported experimental results have not been validated in this release.
+
+All commands below use Bash syntax and run from the repository root. In PowerShell, execute multiline commands on one line or use PowerShell line continuation.
+
+## 1. Install the package
+
+```bash
+git clone https://github.com/longziyu/TRACE.git
+cd TRACE
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+
+# Optional: language-model training and generation
+python -m pip install -e ".[language]"
 ```
 
-Create these directories when supplying your own assets:
+On Windows, activate the environment with `.venv\Scripts\Activate.ps1`. CARLA and ROS are installed separately. Dependency requirements are listed in `pyproject.toml`; a tested environment lockfile is not provided.
+
+## 2. Prepare data and models
+
+Use the following directory layout:
 
 ```text
 data/
-  c2n/raw/                      Original benchmark/scenario assets
-  c2n/processed/                Converted NPZ records and manifest.jsonl
-  peac_qa/raw/                  Existing state-action-reason examples, if available
-  language/qwen/train.jsonl     Verified record-conditioned training examples
-  language/llama/train.jsonl    Matched examples for the second backbone
-  robot/                       Sensor recordings and domain-adapted training samples
+  c2n/processed/
+    manifest.jsonl
+    *.npz
+  language/qwen/train.jsonl
+  language/llama/train.jsonl
 models/
-  Qwen2.5-7B-Instruct/          Downloaded model files, tokenizer, configuration
-  Llama-3.1-8B-Instruct/         Downloaded licensed model files
+  Qwen2.5-7B-Instruct/
+  Llama-3.1-8B-Instruct/
 checkpoints/
 runs/
 ```
 
-No public download location for C2N-Bench or PEAC-QA was supplied with the paper.
-The project does not invent one or automatically fetch those datasets. Put your
-existing data in the paths above and convert it to the documented tensor schema.
-Old PEAC-QA examples alone are not enough to train a consequence predictor or to
-reconstruct candidate comparisons that were never logged.
+Convert navigation data into the NPZ format described in [docs/data_schema.md](docs/data_schema.md). Each sample contains observation history and a demonstration sequence; consequence-training samples also contain candidate sequences, measured outcomes, and optional intervention pairs.
 
-## 2. Method-to-code mapping
+The JSONL manifest assigns each sample to a source group and a split:
 
-| Paper component | Implementation | Important boundary |
-|---|---|---|
-| Temporal multimodal `b_t` | `SceneEncoder`, `History` | RGB, BEV, four feature groups, previous commands; two temporal attention layers |
-| Candidate generator | `MixtureGenerator` | Eight mixture components by default, one sequence from each component, plus brake/forward/left/right |
-| Feasible controls | `project_sequences` | Velocity and acceleration limits; only the first command is executed |
-| Four consequences | `TraceModel.predict` | Ensemble outputs collision probability and three nonnegative normalized costs |
-| Branch/intervention supervision | `collect.py`, `branch_loss` | Matched initial snapshots and fixed candidate sequences |
-| Measured-outcome generator update | `branch_loss` | Empirical admissibility, soft cost weighting, demonstration replay |
-| Risk calibration | `calibrate.py` | Disjoint fit/selection partitions; no successful rule means explicit failure |
-| Explicit action choice | `select` | Admissible minimum-cost choice; lexicographic risk/cost fallback |
-| Shared decision evidence | `Decision` | Candidate sequences, outputs, uncertainty, masks, selected/comparison IDs, contributions |
-| Checked language | `expected_claims`, `verify`, `render` | Fixed claim schema; invalid output falls back to a deterministic template |
-| Asynchronous generation | `AsyncExplainer` | One pending request, one completed-result slot; replacements counted |
-| Temporal validity | `is_current` | Reevaluate cited sequences; invalidate infeasible/mismatched/reversed comparisons |
-| Real robot execution | `real_world/node.py` | Publication, arming, input-age checks, watchdog, and independent laser stop |
-
-The margin condition `m_t > 2B` is not used to skip control updates. Ensemble
-disagreement is not a certified probability bound. Risk calibration applies to
-the checkpoint hash stored in the calibration artifact; mismatched artifacts are
-rejected. Initialization-only checkpoints are rejected for deployment.
-
-The generator is a Gaussian sequence-mixture proposal followed by projection to
-the feasible control set. Its NLL is evaluated in proposal coordinates; this is
-not an exact density of the projected distribution. This explicit approximation
-is an implementation choice where the manuscript leaves details open.
-
-## 3. Environment setup (commands for you to run later)
-
-Use Python 3.10 or newer. ROS 2 installations commonly require the system Python
-and a matching package environment; do not mix a Windows Python environment with
-a Linux ROS installation. A Linux ROS 2 Humble-style environment is the intended
-robot integration target, but it has not been tested here.
-
-From the `code` directory, a simulation environment can be prepared with:
-
-```bash
-python -m venv .venv
-# Linux/macOS:
-source .venv/bin/activate
-# Windows PowerShell alternative:
-# .venv\Scripts\Activate.ps1
-python -m pip install -e .
+```json
+{"file":"scene_001.npz","group_id":"source_scene_001","split":"train","simulator":"carla"}
 ```
 
-Install a PyTorch build matching your compute environment. The package specifies
-minimum dependencies rather than claiming an experimentally tested lockfile.
-After your first successful setup, save a lockfile or `pip freeze` alongside the
-run manifest. CARLA and ROS are optional external runtimes and are deliberately
-not installed by the core package.
+Supported workflow splits are `train`, `validation`, `calibration_fit`, `calibration_select`, and `test`. Keep all related trajectories, branches, and intervention variants within one split. NPZ paths are relative to the manifest directory.
 
-For language training or the local Hugging Face backend:
+C2N-Bench assets and download links are not included in this release. A benchmark-specific exporter is needed to convert existing scenes and rollout records into this format. The reference simulator in the next section provides an independent data-generation workflow.
 
-```bash
-python -m pip install -e ".[language]"
-```
+For learned explanations, place the instruction-model files and tokenizers in the corresponding `models/` directories. Supported configurations include `Qwen/Qwen2.5-7B-Instruct` and `meta-llama/Llama-3.1-8B-Instruct`. Model access is subject to their respective licenses. Loading is local-only and does not download files automatically.
 
-Download the model files yourself from the model repositories named in the paper:
+## 3. Generate reference simulation data
 
-- `Qwen/Qwen2.5-7B-Instruct`
-- `meta-llama/Llama-3.1-8B-Instruct`
-
-Observe the respective access requirements and licenses. Record the exact model
-revision, tokenizer, adapter, and precision. All included model-loading calls use
-`local_files_only=True`; they do not silently download a model. The language
-backend defaults to CPU unless instantiated with another device. A 7B/8B model
-can require substantial memory; no quantization configuration is assumed.
-
-## 4. Data preparation
-
-Read [the complete data schema](docs/data_schema.md) before converting data.
-Each NPZ file stores one source-state history and either a demonstration or a
-candidate set with outcome targets. A JSONL manifest supplies paths, source-group
-identities, and split names. Use the same observation units and channel ordering
-in training, simulation, and on the robot.
-
-The loader checks that a declared source group does not cross partitions. It
-cannot discover hidden duplicates or map aliases. Keep all branches, intervention
-variants, and related trajectories together. A map-unseen claim requires maps to
-be disjoint, not merely different trajectory seeds on the same map.
-
-Train/validation/test selection is a research protocol, not an automatic outcome
-of the directory name. The supplied training script trains on `train`; it does
-not automatically pick a best checkpoint on validation or report confidence
-intervals. Run a separate validation campaign before choosing checkpoints.
-
-## 5. Reference simulation: collection and training
-
-The 2-D world is provided to make the data path and branch semantics concrete.
-It supplies a synthetic local raster in the RGB slot, idealized range sectors,
-visible pedestrian tracks, and a geodesic distance target. It is **not CARLA,
-not C2N-Bench, and not photorealistic camera training**. It uses deterministic
-pedestrian trajectories and a fixed obstacle layout. Its scene-seed splits are
-not map-held-out splits.
-
-Example workflow, from `code/`:
+The included 2-D simulator supports saved-state branching and scene interventions. It uses synthetic sensor representations, a fixed obstacle layout, and deterministic pedestrian motion. It is a development environment, not C2N-Bench or a substitute for its experimental protocol.
 
 ```bash
-# Stage 1: collect demonstrations from the geometric local teacher.
 trace-collect --config configs/default.yaml --mode demos \
   --output data/reference_demos --scenes 30 --states 40
+```
 
-trace-train --config configs/default.yaml --manifest data/reference_demos/manifest.jsonl \
+This creates demonstration NPZ files and `data/reference_demos/manifest.jsonl`. Collection rounds require separate output directories.
+
+## 4. Train the navigation model
+
+### Stage 1: candidate initialization
+
+```bash
+trace-train --config configs/default.yaml \
+  --manifest data/reference_demos/manifest.jsonl \
   --stage init --epochs 20 --output checkpoints/initialization.pt
+```
 
-# Freeze that generator while collecting matched branch outcomes.
+### Collect candidate outcomes and intervention pairs
+
+```bash
 trace-collect --config configs/default.yaml --mode branches \
-  --checkpoint checkpoints/initialization.pt --output data/reference_round01 \
-  --scenes 30 --states 40 --repetitions 20 --intervention reverse_pedestrian
+  --checkpoint checkpoints/initialization.pt \
+  --output data/reference_round01 --scenes 30 --states 40 \
+  --repetitions 20 --intervention reverse_pedestrian
+```
 
-# Stage 2: learn consequences and refine proposals using measured outcomes.
-trace-train --config configs/default.yaml --manifest data/reference_round01/manifest.jsonl \
+Available interventions are `reverse_pedestrian` and `block_passage`. Candidate generation remains frozen during collection. Repeated deterministic rollouts do not estimate stochastic pedestrian uncertainty; stochastic experiments require a corresponding simulator and matched random seeds.
+
+### Stage 2: consequence learning and generator refinement
+
+```bash
+trace-train --config configs/default.yaml \
+  --manifest data/reference_round01/manifest.jsonl \
   --stage consequence --resume checkpoints/initialization.pt \
   --epochs 20 --output checkpoints/navigation.pt
+```
 
-# Fit the isotonic map, then select beta on a disjoint calibration partition.
+For additional rounds, collect new branches using the updated checkpoint and resume stage 2 on the new manifest. Preserve source-group split assignments across rounds. Model selection on validation data is a separate step.
+
+Configuration values are defined in `configs/default.yaml`. Observation-history length, horizon, candidate count, and normalization must match the dataset. To disable the intervention-difference loss on the same data, add `--change-weight 0` to stage 2.
+
+## 5. Calibrate collision-risk screening
+
+```bash
 trace-calibrate --checkpoint checkpoints/navigation.pt \
-  --manifest data/reference_round01/manifest.jsonl --output checkpoints/calibration.json
+  --manifest data/reference_round01/manifest.jsonl \
+  --output checkpoints/calibration.json
+```
 
-# Run the policy with asynchronous deterministic explanations.
-trace-sim --checkpoint checkpoints/navigation.pt --calibration checkpoints/calibration.json \
+Calibration uses separate `calibration_fit` and `calibration_select` partitions. It fails explicitly if no candidate screening rule meets the empirical selection criterion. Deployment requires a stage-2 checkpoint and a calibration artifact matching its hash. The screening rule is empirical and does not certify collision-free behavior.
+
+## 6. Evaluate in the reference simulator
+
+```bash
+trace-sim --checkpoint checkpoints/navigation.pt \
+  --calibration checkpoints/calibration.json \
   --episodes 10 --seed 1000 --output runs/reference_eval01
 
 trace-evaluate --episodes runs/reference_eval01/episodes.jsonl \
   --output runs/reference_eval01/metrics.json
 ```
 
-PowerShell does not use `\` as a line continuation: put each command on one line
-or use PowerShell's backtick continuation. The examples above use Bash syntax.
+Outputs include per-episode decision logs, explanation status, control-cycle duration, episode summaries, and navigation metrics. Reported metrics are success rate, collision rate, timeout rate, and average completion time over successful episodes. Completion time is `null` when no episode succeeds.
 
-There is no promise that the untested reference defaults produce a passing
-calibration rule or useful navigation. If calibration fails, inspect data quality,
-prediction error, and coverage; do not bypass it by labelling an uncalibrated
-model safe. Collection rounds must use new directories. To alternate training
-and data refresh, run branch collection with the newly trained checkpoint and
-then resume stage 2 on the new manifest. Keep source split assignments fixed.
+Use a new output directory for each evaluation run. The reference simulator advances once per control step; its simulated completion time excludes computation time. `--realtime` paces wall-clock execution but does not make the world advance during inference. Latency studies require a continuously advancing simulator or physical robot.
 
-`block_passage` is another available intervention. An intervention is applied at
-the current observation only; earlier history remains the factual pre-intervention
-history. Check that your intervention is physically valid and does not start the
-robot in collision. The geometric reference layout is illustrative; custom scenes
-need their own intervention validators. A distant change may legitimately have
-zero effect within the finite prediction horizon.
+## 7. Train and enable the interpreter
 
-The reference environment advances once per controller step. Its simulated
-completion time excludes computation time; `--realtime` only paces wall-clock
-execution and does not turn it into a simulator that advances during inference.
-Do not use reference-world logs as evidence for the asynchronous latency claim.
-Use a continuously advancing external simulator or physical robot for that test.
+Prepare verified decision-record examples according to the [language data schema](docs/data_schema.md). Stage 3 updates the language adapter without updating the navigation model.
 
-## 6. CARLA live evaluation and C2N-Bench integration
+```bash
+trace-language-train --model models/Qwen2.5-7B-Instruct \
+  --records data/language/qwen/train.jsonl \
+  --output checkpoints/qwen_adapter
 
-Install and launch the CARLA server separately, and install its matching Python
-client in your environment. Server/client versions must match your deployment.
-Prepare your pedestrian scenario externally. The included adapter deliberately
-does not assume the unavailable C2N-Bench map list, split definition, scenario
-loader, or proprietary robot actor.
+# Alternative backbone
+trace-language-train --model models/Llama-3.1-8B-Instruct \
+  --records data/language/llama/train.jsonl \
+  --output checkpoints/llama_adapter
+```
 
-The supplied `carla_adapter.py` attaches RGB, semantic LiDAR, and collision
-sensors to an existing `walker.pedestrian.*` ego actor. Stop that actor's AI
-controller before TRACE takes over. Configure the server to advance
-asynchronously, including while Python performs inference. On Linux, for example:
+Enable a local model and trained adapter during simulation:
+
+```bash
+trace-sim --checkpoint checkpoints/navigation.pt \
+  --calibration checkpoints/calibration.json \
+  --language-model models/Qwen2.5-7B-Instruct \
+  --language-adapter checkpoints/qwen_adapter \
+  --output runs/language_eval01
+```
+
+Without `--language-model`, the runner uses deterministic explanations from the decision record. The learned backend produces structured claims that are checked and rendered into text. Invalid output falls back to a template. The checker does not validate arbitrary free-form prose.
+
+The asynchronous worker uses bounded queues. Pending requests can be replaced, but an active model call is not forcibly interrupted. Queue cancellation therefore does not imply that inference computation was canceled. Results whose premises no longer hold are marked historical.
+
+## 8. Run with CARLA
+
+Start an asynchronously advancing CARLA server and install its matching Python client. Initialize the scene externally, identify an existing `walker.pedestrian.*` ego actor, and stop its AI controller before connecting TRACE.
 
 ```bash
 export CARLA_HOST=127.0.0.1
@@ -244,271 +177,67 @@ trace-sim --checkpoint checkpoints/carla_navigation.pt \
   --episodes 1 --output runs/carla_episode01
 ```
 
-Replace actor ID and goal with actual values. The adapter owns and destroys only
-its attached sensors; it stops but does not destroy the externally owned ego.
-Reset the scene/ego/goal before each episode. Do not request repeated episodes on
-the same unreset actor and treat them as independent trials.
+Actor ID and goal coordinates must match the initialized scene. Reset the scene before each episode. The adapter attaches RGB, semantic LiDAR, and collision sensors, then releases those sensors on shutdown.
 
-CARLA's walker is a **surrogate** for velocity-command integration. In particular,
-in-place turning and acceleration do not reproduce TurtleBot dynamics. Replace
-`execute()` with your benchmark's robot actuator when measuring the paper's
-navigation performance. The adapter converts CARLA's left-handed coordinates to
-the core's x-forward/y-left convention. Semantic LiDAR supplies observed class/ID
-information; it is not an omniscient actor-state query, but it is privileged
-semantic sensing relative to a real detector. Report that input difference or
-replace it with the same perception system used on the robot. Verify semantic
-labels against your installed CARLA version before collecting data.
+The walker is a surrogate for velocity-command integration; it does not reproduce differential-drive dynamics. Semantic LiDAR also differs from real-world pedestrian detection. Benchmark-specific actuation, perception, and deterministic branch reconstruction require additional integration. The included adapter does not supply a C2N-Bench scenario loader or exact CARLA snapshot restoration.
 
-The adapter requires fresh camera and LiDAR packets and reports collision before
-success. It does not implement an exact world snapshot/restore. CARLA actor
-transforms alone are insufficient to restore controller states and randomness.
-For branch training in C2N-Bench, rebuild each source scenario using your scenario
-runner and matched random seeds, execute the fixed candidate sequences, and export
-the NPZ schema. The reference world's snapshot mechanism is not used to make
-false deterministic-reset claims about CARLA.
+Other simulator wrappers can implement `observe`, `execute`, `timestamp`, and `close`, then be loaded with `--adapter module:factory`. The interface is defined in `src/trace_nav/simulation/adapters.py`.
 
-To use an existing simulator wrapper, implement:
+## 9. Run the ROS 2 nodes
 
-```python
-class MyAdapter:
-    def observe(self):
-        # Return the single-frame observation dictionary from data_schema.md.
-        ...
-    def execute(self, command):
-        # Apply [v, w], then report booleans collision, goal, and timeout.
-        ...
-    def timestamp(self):
-        # Return simulation time in seconds, monotonically within an episode.
-        ...
-    def close(self):
-        # Stop commands and release only resources owned by this adapter.
-        ...
+Source the ROS and robot workspaces, install the package into the compatible Python environment, and configure absolute checkpoint paths and topic names in `configs/ros.yaml`. Robot drivers, localization, tracking, coordinate transforms, and the command multiplexer are external components.
 
-def create(options):
-    # options contains a Config object and an episode seed.
-    return MyAdapter()
-```
-
-Then pass `--adapter your_module:create`. Ensure that the simulator progresses
-during inference and that timestamps, episode timeout, and the actual applied
-commands reflect that progression.
-
-## 7. Language training, checks, and asynchronous output
-
-The template backend is the default and does not require a language model.
-For learned explanations, prepare verified decision-record JSONL and train:
+The package uses Python entry points and does not require `colcon build`.
 
 ```bash
-trace-language-train --model models/Qwen2.5-7B-Instruct \
-  --records data/language/qwen/train.jsonl --output checkpoints/qwen_adapter
-
-trace-language-train --model models/Llama-3.1-8B-Instruct \
-  --records data/language/llama/train.jsonl --output checkpoints/llama_adapter
-
-trace-sim --checkpoint checkpoints/navigation.pt --calibration checkpoints/calibration.json \
-  --language-model models/Qwen2.5-7B-Instruct \
-  --language-adapter checkpoints/qwen_adapter --output runs/language_eval01
-```
-
-Stage 3 loads only the language model: it cannot update the navigation weights.
-Prompts are masked out of the causal loss. An example whose prompt consumes the
-entire sequence budget is rejected rather than silently trained with no targets.
-The trainer saves a LoRA adapter, not a merged full model. Match examples,
-training budgets, and validation criteria within each backbone for ablations.
-
-The checked backend requests an exact JSON claim object and verifies candidate
-references, reason category, numeric values, contribution signs via equality,
-and the required uncertainty field. It then renders trusted claims into text.
-Invalid JSON, extra fields, unsupported causes, or inference failures trigger a
-record-derived fallback. **Arbitrary generated natural language is not certified
-by this checker.** Natural free-form explanations and their human readability
-study need an extended extraction/annotation pipeline; no fake human scores are
-generated by this package.
-
-The worker has one waiting request and one waiting result. Replacement counters
-measure queue drops; invalidity is represented by `historical=true` at publication.
-An already running Transformers call is not forcefully interrupted, and the
-daemon thread may continue until it finishes. Thus cancellation counters do not
-measure GPU work saved. For hard cancellation or resource isolation, host the
-language worker in a separate service/process and retain the same record schema.
-The current thread implementation separates waiting but can still contend for
-CPU/GPU resources; measure complete loop timing on your hardware.
-
-Temporal validity rechecks the old selected/comparison sequences at the current
-scene representation. A changed numeric candidate ID by itself does not invalidate
-the explanation. Infeasible sequences, changed admissibility, reversed cost order,
-different semantic behavior, excessive age, or mismatched first commands make an
-output historical. This conservative implementation may discard useful text;
-report coverage and cancellation alongside stale-output rate.
-
-## 8. Real-world ROS 2 deployment
-
-Run this on the robot computer or a ROS-networked host with compatible ROS 2,
-PyTorch, `rclpy`, `sensor_msgs`, `nav_msgs`, `geometry_msgs`, `std_msgs`, `cv_bridge`,
-and OpenCV installed. Source your ROS and robot workspaces before using the Python
-entry points. For example, use your actual ROS setup path rather than assuming
-the example distribution is installed:
-
-```bash
-source /opt/ros/humble/setup.bash
-source /path/to/robot_ws/install/setup.bash
-python -m pip install -e .
-```
-
-The package is invoked as Python/console entry points; it is not an ament package
-and does not require `colcon build`. A ROS-native launch package can wrap these
-entry points later. The TurtleBot driver, SLAM/localization, object detector,
-pedestrian tracker, and command multiplexer are external dependencies.
-
-### Input and output topics
-
-| Topic | ROS type | Meaning |
-|---|---|---|
-| `/camera/color/image_raw` | `sensor_msgs/Image` | Camera image; converted to RGB |
-| `/scan` | `sensor_msgs/LaserScan` | Range sensing and independent near-obstacle stop |
-| `/odom` | `nav_msgs/Odometry` | Pose and measured motion |
-| `/trace/goal` | `geometry_msgs/PoseStamped` | Goal already transformed into the odometry frame |
-| `/trace/people` | `geometry_msgs/PoseArray` | Detected/tracked positions in the same frame |
-| `/trace/observation` | `std_msgs/String` | Explicit JSON sensor tensor packet |
-| `/trace/cmd_vel` | `geometry_msgs/Twist` | Controller output, before robot-specific mux/driver |
-| `/trace/decision` | `std_msgs/String` | Decision evidence, actual command, override reason, latency |
-| `/trace/explanation` | `std_msgs/String` | Text, fallback flag, historical flag, override reason |
-
-The bridge requires a fresh people message by default. Publish an **empty but
-fresh** PoseArray when the detector sees no pedestrians; do not disable freshness
-checks to hide a failed detector. PoseArray has no stable identity or velocity
-fields, so the bridge leaves velocity features zero. For the full temporal
-feature contract, replace this input with a tracked-object message and estimate
-velocities in a common frame. Train with the representation actually deployed.
-
-The bridge does not transform sensor extrinsics with TF. It assumes the laser is
-aligned with the robot's x-forward/y-left planar frame and that the goal/people
-poses are already in the configured odometry frame. Add your actual TF/extrinsic
-transforms before using an offset or rotated sensor. The `/trace/goal` timestamp
-does not need continual refresh, but sensor packets do. Record actual driver and
-sensor frame names; do not rename headers to conceal frame mismatches.
-
-### Starting the nodes
-
-Edit absolute model paths and topic names in `configs/ros.yaml` first. Use a
-checkpoint trained with real-sensor-compatible observations and a corresponding
-calibration artifact; the reference raster checkpoint is not suitable for direct
-robot transfer.
-
-```bash
-# Terminal 1: after camera, LiDAR, localization, and pedestrian perception start
+# Sensor bridge
 python -m trace_nav.real_world.sensor_bridge --ros-args --params-file configs/ros.yaml
 
-# Terminal 2: computation runs, but motion is disabled by default
+# Controller, in a separate terminal; motion is disabled by default
 trace-ros --ros-args --params-file configs/ros.yaml
+```
 
-# Inspect outputs before connecting the output topic to the robot command mux
+Default topics:
+
+| Topic | Message type | Purpose |
+|---|---|---|
+| `/camera/color/image_raw` | `sensor_msgs/Image` | RGB input |
+| `/scan` | `sensor_msgs/LaserScan` | Range input |
+| `/odom` | `nav_msgs/Odometry` | Robot pose and motion |
+| `/trace/goal` | `geometry_msgs/PoseStamped` | Navigation goal |
+| `/trace/people` | `geometry_msgs/PoseArray` | Pedestrian positions |
+| `/trace/observation` | `std_msgs/String` | Serialized observation |
+| `/trace/cmd_vel` | `geometry_msgs/Twist` | Output command |
+| `/trace/decision` | `std_msgs/String` | Decisions and execution overrides |
+| `/trace/explanation` | `std_msgs/String` | Explanations and validity flags |
+
+Goals and pedestrian positions must already be expressed in the configured odometry frame. The bridge assumes aligned planar LiDAR coordinates; sensor extrinsics require an appropriate transform adapter. Fresh pedestrian messages are required by default, including empty messages when no pedestrians are detected. PoseArray does not supply track velocities, so those feature slots remain zero and motion information relies on history. Training data must match the deployed observation convention.
+
+Inspect outputs and connect `/trace/cmd_vel` through the robot's command mux before enabling motion. Maintain an independent driver timeout and physical stop mechanism.
+
+```bash
 ros2 topic echo /trace/decision
 ros2 topic echo /trace/explanation
 
-# Enable motion only after verifying your driver/mux, physical E-stop, and frame setup
+# Enable or disable motion
 ros2 param set /trace_controller armed true
-
-# Disable motion
 ros2 param set /trace_controller armed false
 ```
 
-`/trace/cmd_vel` intentionally does not automatically take over `/cmd_vel`. Route
-it through your robot's command mux/velocity limiter. If the final actuator command
-is modified downstream, set `executed_command_topic` to that actual command stream
-so history reflects what was sent to the robot. The sensor bridge keeps measured
-odometry velocities separately in `robot` features.
+The controller stops on stale input, deadline misses, goal arrival, laser-stop conditions, or disarming. Policy selection and the actual command are recorded separately. If a downstream driver modifies the command, configure `executed_command_topic` to reference that actual command stream.
 
-The controller publishes zero commands when disarmed, input is stale, inference
-misses the watchdog deadline, the goal is reached, or the laser stop is triggered.
-The watchdog uses a separate executor callback group; a blocked inference callback
-cannot deliberately hold the last command indefinitely through that callback.
-Python scheduling and a failed host still require an independent driver timeout
-and physical stop mechanism. Configure those in the robot driver/mux.
+Optional `language_model` and `language_adapter` parameters select local model directories; an empty model path uses template explanations. A reference-raster checkpoint is not suitable for direct robot deployment without sensor-compatible training and calibration.
 
-Policy selection and the executed command are separate fields. A stop override
-must not be explained as if the neural selector chose it. During an override,
-pending explanations are marked historical and new policy explanations are not
-requested. Record intervention counts when evaluating physical trials.
+## 10. Checks and reproducibility records
 
-Optional ROS language parameters `language_model` and `language_adapter` accept
-local directories; empty `language_model` uses the template backend. Leave
-navigation and language on separate devices/processes if your measured deadline
-cannot tolerate contention. Match the simulator's speed, acceleration, sensor
-normalization, and safety-shield rules to deployment before interpreting transfer.
-
-## 9. Evaluation, logging, and ablations
-
-`trace-sim` logs decisions and complete observation-to-command wall-clock duration
-to per-episode JSONL files. Episode summaries separately retain simulation time
-and wall time. `trace-evaluate` reports SR, CR, timeout rate, other outcomes, and
-successful-episode AT. AT is `null` when no episode succeeds. Collision has priority
-over success. No synthetic result table is generated or copied from the manuscript.
-
-The probability utility computes Brier score and equal-width-bin ECE. Use the
-calibrated **mean probability**, not the conservative screening score, for these
-metrics. Training data in this compact format contains mean repeated outcomes;
-for exact binary-sample Brier score, score the original repeated binary labels.
-MAEs, candidate regret, accepted-candidate frequency, and intervention differences
-can be calculated from exported predictions and the target arrays. Keep their
-denominators and normalization explicit.
-
-The following comparisons are supported by concrete modules or controlled changes:
-
-- Same data without difference supervision: stage 2 with `--change-weight 0`.
-- Equal-budget ordinary data: collect an unpaired dataset with the same simulated
-  candidate-step budget and training updates; the default collector creates pairs,
-  so use a converter/custom collector and omit `intervention_*` keys consistently.
-- No history: retrain with `history: 1` and recollect/convert matching observation
-  arrays. Do not load an incompatible position-embedding checkpoint.
-- No conservative uncertainty term: recalibrate/evaluate a separately recorded
-  `beta=0` rule. Do not silently edit a published calibration artifact.
-- No risk screening or geometric evaluation: replace the selector in a named
-  experimental controller and log that variant. These baselines are not silently
-  substituted into the main TRACE controller.
-- Explanation access/check/monitor ablations: keep navigation records frozen;
-  build restricted prompts or bypass checks only in isolated offline evaluation.
-  Preserve generation outputs and annotations for WRR/UCR/coverage scoring.
-- Synchronous language delay: implement a separate control scheduling experiment
-  in a continuously advancing simulator; the default runner is asynchronous.
-  Inject delay into language generation, not by pausing the simulator clock.
-
-Generic RL/IL baseline training, human scoring, automatic free-text claim extraction,
-full experiment sweeps, and a benchmark-specific C2N-Bench collector are not
-bundled. Their absence is explicit rather than replaced with fabricated scores
-or no-op implementations. They require the corresponding baseline repositories,
-annotations, and scenario definitions.
-
-Store independent training seeds, scene provenance, calibration partition counts,
-command limits, simulator/client versions, model hashes, model revisions, hardware,
-precision, and exact source revision with every run. Bootstrap source groups and
-training seeds rather than treating correlated branches as independent trials.
-The empirical calibration selector has limited reliability with few groups or
-zero observed collisions; its bootstrap bound is not a safety certificate.
-
-## 10. Static checking and current limitations
-
-The only check intended without installing runtime dependencies is:
+A dependency-free source check is available:
 
 ```bash
 python tools/static_check.py
 ```
 
-This parses Python source with `ast.parse`; it does not import PyTorch, ROS,
-Transformers, or CARLA, launch anything, download files, or execute a model.
-Syntax checks cannot prove tensor-shape correctness for arbitrary external data,
-ROS topic compatibility, simulator API compatibility, runtime memory fit, or robot
-behavior. Those must be checked later in your actual environment.
+This parses Python files without importing runtime dependencies or executing training, simulation, model inference, or ROS. It does not replace environment-specific integration tests.
 
-Before a first runtime attempt, provide:
+For each experiment, retain the source revision, dataset provenance, split manifest, independent training seeds, checkpoint and calibration artifacts, model revisions, simulator/client versions, hardware, precision, and actual command limits. Confidence intervals require source-group and training-seed information rather than treating correlated branches as independent observations.
 
-1. Actual dataset/scenario assets and a provenance-preserving manifest.
-2. A stage-2 checkpoint and matching successful calibration artifact.
-3. Local language model files if using learned explanations.
-4. A running simulator with the expected sensor/actuator setup, or ROS topics,
-   localization, tracking, frame transforms, and the robot command mux.
-5. Hardware-specific dependency versions and configuration values.
-
-The repository deliberately leaves unresolved scientific choices visible in this
-README. Completing these integration steps is different from merely fixing Python
-syntax, and matching the paper's numerical tables requires actual experiments.
+Generic IL/RL baselines, human annotation, unrestricted text evaluation, and full experimental sweeps are not included. Further details are available in [docs/data_schema.md](docs/data_schema.md) and [docs/implementation_status.md](docs/implementation_status.md).

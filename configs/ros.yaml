@@ -1,0 +1,26 @@
+trace_controller:
+  ros__parameters:
+    checkpoint: /absolute/path/to/trace/code/checkpoints/navigation.pt
+    calibration: /absolute/path/to/trace/code/checkpoints/calibration.json
+    device: cpu
+    armed: false
+    observation_topic: /trace/observation
+    command_topic: /trace/cmd_vel
+    max_input_age: 0.35
+    watchdog_seconds: 0.3
+    stop_distance: 0.35
+    language_model: ""
+    language_adapter: ""
+trace_sensor_bridge:
+  ros__parameters:
+    rgb_topic: /camera/color/image_raw
+    scan_topic: /scan
+    odom_topic: /odom
+    goal_topic: /trace/goal
+    people_topic: /trace/people
+    frame_id: odom
+    sensor_max_age: 0.3
+    require_people: true
+    scan_range: 4.0
+    goal_scale: 20.0
+    executed_command_topic: /trace/cmd_vel

@@ -1,0 +1,26 @@
+seed: 42
+device: cpu
+dt: 0.1
+history: 8
+horizon: 20
+learned_candidates: 8
+ensemble: 5
+hidden: 256
+max_v: 0.5
+max_w: 1.0
+max_a: 0.5
+max_alpha: 1.5
+robot_radius: 0.18
+proximity_radius: 0.6
+goal_scale: 20.0
+distance_cap: 40.0
+weights: [0.6, 0.3, 0.1]
+risk_threshold: 0.10
+change_weight: 1.0
+generator_temperature: 0.1
+goal_tolerance: 0.3
+episode_seconds: 240.0
+explanation_max_age: 2.0
+explanation_action_tolerance: 0.08
+language_model: Qwen/Qwen2.5-7B-Instruct
+language_revision: null

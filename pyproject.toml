@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-navigation"
+version = "0.1.0"
+description = "Reference implementation of decision-grounded TRACE navigation"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "torch>=2.1", "PyYAML>=6.0", "scikit-learn>=1.3"]
+
+[project.optional-dependencies]
+language = ["transformers>=4.45", "peft>=0.13", "accelerate>=0.34"]
+
+[project.scripts]
+trace-sim = "trace_nav.simulation.run:main"
+trace-collect = "trace_nav.simulation.collect:main"
+trace-train = "trace_nav.training.train:main"
+trace-calibrate = "trace_nav.training.calibrate:main"
+trace-language-train = "trace_nav.training.language:main"
+trace-ros = "trace_nav.real_world.node:main"
+trace-evaluate = "trace_nav.evaluation:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

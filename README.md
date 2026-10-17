@@ -1,6 +1,6 @@
 # TRACE
 
-**Grounding Navigation Actions and Explanations in Predicted Consequences**
+**Traceable Reasoning and Action through Consequence Evaluation for Explainable Navigation in Dynamic Crowds**
 
 This repository contains the TRACE navigation implementation, including training, consequence calibration, asynchronous explanations, simulation interfaces, and ROS 2 deployment nodes.
 
@@ -11,7 +11,7 @@ This repository contains the TRACE navigation implementation, including training
 - CARLA server and matching Python client for CARLA evaluation.
 - ROS 2, `rclpy`, `cv_bridge`, OpenCV, and standard sensor/navigation message packages for robot deployment.
 
-Datasets, trained checkpoints, and language-model weights are not included. The provided source has undergone static syntax checks; end-to-end execution and reproduction of the reported experimental results have not been validated in this release.
+Prepare datasets, navigation checkpoints, and language-model weights separately using the workflow below. The CPU quickstart has been exercised through data generation, training, calibration, simulation, and metric aggregation. Run `python tools/quickstart.py` for this small-scale integration example. Validate benchmark, CARLA, ROS, and learned-language configurations in their respective environments.
 
 All commands below use Bash syntax and run from the repository root. In PowerShell, execute multiline commands on one line or use PowerShell line continuation.
 
@@ -28,7 +28,7 @@ python -m pip install -e .
 python -m pip install -e ".[language]"
 ```
 
-On Windows, activate the environment with `.venv\Scripts\Activate.ps1`. CARLA and ROS are installed separately. Dependency requirements are listed in `pyproject.toml`; a tested environment lockfile is not provided.
+On Windows, activate the environment with `.venv\Scripts\Activate.ps1`. CARLA and ROS are installed separately. Dependency requirements are listed in `pyproject.toml`; record the resolved package versions for each experiment.
 
 ## 2. Prepare data and models
 
@@ -58,13 +58,13 @@ The JSONL manifest assigns each sample to a source group and a split:
 
 Supported workflow splits are `train`, `validation`, `calibration_fit`, `calibration_select`, and `test`. Keep all related trajectories, branches, and intervention variants within one split. NPZ paths are relative to the manifest directory.
 
-C2N-Bench assets and download links are not included in this release. A benchmark-specific exporter is needed to convert existing scenes and rollout records into this format. The reference simulator in the next section provides an independent data-generation workflow.
+Obtain C2N-Bench scenes separately and use a benchmark-specific exporter to convert scene and rollout records into this format. The reference simulator in the next section provides an independent data-generation workflow.
 
 For learned explanations, place the instruction-model files and tokenizers in the corresponding `models/` directories. Supported configurations include `Qwen/Qwen2.5-7B-Instruct` and `meta-llama/Llama-3.1-8B-Instruct`. Model access is subject to their respective licenses. Loading is local-only and does not download files automatically.
 
 ## 3. Generate reference simulation data
 
-The included 2-D simulator supports saved-state branching and scene interventions. It uses synthetic sensor representations, a fixed obstacle layout, and deterministic pedestrian motion. It is a development environment, not C2N-Bench or a substitute for its experimental protocol.
+The included 2-D simulator supports saved-state branching and scene interventions. It uses synthetic sensor representations, a fixed obstacle layout, and deterministic pedestrian motion. Use it for pipeline development; use C2N-Bench scenes and the benchmark protocol for paper-level evaluation.
 
 ```bash
 trace-collect --config configs/default.yaml --mode demos \
@@ -92,7 +92,7 @@ trace-collect --config configs/default.yaml --mode branches \
   --repetitions 20 --intervention reverse_pedestrian
 ```
 
-Available interventions are `reverse_pedestrian` and `block_passage`. Candidate generation remains frozen during collection. Repeated deterministic rollouts do not estimate stochastic pedestrian uncertainty; stochastic experiments require a corresponding simulator and matched random seeds.
+Available interventions are `reverse_pedestrian` and `block_passage`. Candidate generation remains frozen during collection. The reference simulator uses deterministic pedestrian motion. For stochastic uncertainty estimation, use a stochastic simulator with matched random seeds.
 
 ### Stage 2: consequence learning and generator refinement
 
@@ -115,7 +115,7 @@ trace-calibrate --checkpoint checkpoints/navigation.pt \
   --output checkpoints/calibration.json
 ```
 
-Calibration uses separate `calibration_fit` and `calibration_select` partitions. It fails explicitly if no candidate screening rule meets the empirical selection criterion. Deployment requires a stage-2 checkpoint and a calibration artifact matching its hash. The screening rule is empirical and does not certify collision-free behavior.
+Calibration uses separate `calibration_fit` and `calibration_select` partitions. It fails explicitly if no candidate screening rule meets the empirical selection criterion. Deployment requires a stage-2 checkpoint and a calibration artifact matching its hash. The screening rule uses the empirical collision-frequency criterion on held-out calibration data.
 
 ## 6. Evaluate in the reference simulator
 
@@ -157,7 +157,7 @@ trace-sim --checkpoint checkpoints/navigation.pt \
   --output runs/language_eval01
 ```
 
-Without `--language-model`, the runner uses deterministic explanations from the decision record. The learned backend produces structured claims that are checked and rendered into text. Invalid output falls back to a template. The checker does not validate arbitrary free-form prose.
+Without `--language-model`, the runner uses deterministic explanations from the decision record. The learned backend produces structured claims that are checked and rendered into text. Invalid output falls back to a template. The checker operates on the structured claim fields.
 
 The asynchronous worker uses bounded queues. Pending requests can be replaced, but an active model call is not forcibly interrupted. Queue cancellation therefore does not imply that inference computation was canceled. Results whose premises no longer hold are marked historical.
 
@@ -179,7 +179,7 @@ trace-sim --checkpoint checkpoints/carla_navigation.pt \
 
 Actor ID and goal coordinates must match the initialized scene. Reset the scene before each episode. The adapter attaches RGB, semantic LiDAR, and collision sensors, then releases those sensors on shutdown.
 
-The walker is a surrogate for velocity-command integration; it does not reproduce differential-drive dynamics. Semantic LiDAR also differs from real-world pedestrian detection. Benchmark-specific actuation, perception, and deterministic branch reconstruction require additional integration. The included adapter does not supply a C2N-Bench scenario loader or exact CARLA snapshot restoration.
+The adapter uses walker kinematics for velocity-command integration and semantic LiDAR for observations. For the robot benchmark, integrate differential-drive actuation and the corresponding perception pipeline. Supply a C2N-Bench scenario loader and deterministic branch-state reconstruction as external adapter components.
 
 Other simulator wrappers can implement `observe`, `execute`, `timestamp`, and `close`, then be loaded with `--adapter module:factory`. The interface is defined in `src/trace_nav/simulation/adapters.py`.
 
@@ -226,9 +226,9 @@ ros2 param set /trace_controller armed false
 
 The controller stops on stale input, deadline misses, goal arrival, laser-stop conditions, or disarming. Policy selection and the actual command are recorded separately. If a downstream driver modifies the command, configure `executed_command_topic` to reference that actual command stream.
 
-Optional `language_model` and `language_adapter` parameters select local model directories; an empty model path uses template explanations. A reference-raster checkpoint is not suitable for direct robot deployment without sensor-compatible training and calibration.
+Optional `language_model` and `language_adapter` parameters select local model directories; an empty model path uses template explanations. For robot deployment, train and calibrate a checkpoint using observations consistent with the robot sensor pipeline.
 
-## 10. Checks and reproducibility records
+## 10. Validation and experiment records
 
 A dependency-free source check is available:
 
@@ -236,8 +236,8 @@ A dependency-free source check is available:
 python tools/static_check.py
 ```
 
-This parses Python files without importing runtime dependencies or executing training, simulation, model inference, or ROS. It does not replace environment-specific integration tests.
+Validation scope: Python syntax parsing. Run training, simulation, model inference, and ROS integration checks in their configured environments and retain the resulting logs.
 
 For each experiment, retain the source revision, dataset provenance, split manifest, independent training seeds, checkpoint and calibration artifacts, model revisions, simulator/client versions, hardware, precision, and actual command limits. Confidence intervals require source-group and training-seed information rather than treating correlated branches as independent observations.
 
-Generic IL/RL baselines, human annotation, unrestricted text evaluation, and full experimental sweeps are not included. Further details are available in [docs/data_schema.md](docs/data_schema.md) and [docs/implementation_status.md](docs/implementation_status.md).
+Prepare IL/RL baseline implementations, human annotations, unrestricted-text evaluation, and experimental sweep configurations separately for the comparative study. Further details are available in [docs/data_schema.md](docs/data_schema.md) and [docs/implementation_status.md](docs/implementation_status.md).

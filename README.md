@@ -236,8 +236,6 @@ A dependency-free source check is available:
 python tools/static_check.py
 ```
 
-Validation scope: Python syntax parsing. Run training, simulation, model inference, and ROS integration checks in their configured environments and retain the resulting logs.
-
 For each experiment, retain the source revision, dataset provenance, split manifest, independent training seeds, checkpoint and calibration artifacts, model revisions, simulator/client versions, hardware, precision, and actual command limits. Confidence intervals require source-group and training-seed information rather than treating correlated branches as independent observations.
 
 Prepare IL/RL baseline implementations, human annotations, unrestricted-text evaluation, and experimental sweep configurations separately for the comparative study. Further details are available in [docs/data_schema.md](docs/data_schema.md) and [docs/implementation_status.md](docs/implementation_status.md).
